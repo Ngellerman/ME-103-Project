@@ -12,7 +12,7 @@ For every .ply in a folder:
   6. Write a CSV: file name, volume, and quality checks
 
 Usage:
-    pip install open3d trimesh
+    python -m pip install open3d trimesh networkx scipy
     python ply_volumes.py /path/to/scans                       # scans already in mm
     python ply_volumes.py /path/to/scans --scale 1000          # scans in metres
     python ply_volumes.py /path/to/scans --save-meshes meshes  # also keep meshes to inspect
@@ -54,6 +54,16 @@ def process(path: Path, res: float, scale: float, save_dir: Path | None) -> dict
     # 1) light cleanup
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.5)
 
+    # Keep only the largest connected cluster of points. Detached debris (fixture
+    # bits, dust, a second object) makes normal orientation hang and adds fragments.
+    nn = np.asarray(pcd.compute_nearest_neighbor_distance())
+    eps = 5 * float(np.median(nn))
+    labels = np.asarray(pcd.cluster_dbscan(eps=eps, min_points=5))
+    if labels.max() >= 0:
+        main = np.bincount(labels[labels >= 0]).argmax()
+        pcd = pcd.select_by_index(np.flatnonzero(labels == main))
+    n_kept = len(pcd.points)
+
     # 2) normals (always re-estimate orientation; scanner normals are often view-dependent)
     if not pcd.has_normals():
         pcd.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=30))
@@ -74,13 +84,21 @@ def process(path: Path, res: float, scale: float, save_dir: Path | None) -> dict
     mesh.remove_unreferenced_vertices()
 
     tm = trimesh.Trimesh(np.asarray(mesh.vertices), np.asarray(mesh.triangles), process=True)
-    # keep the largest closed component (drops small floating blobs)
+    # Keep the main body and drop small floating fragments. Fragments can be flat
+    # (zero volume), which makes trimesh divide by zero, so rank pieces by surface
+    # area rather than volume, preferring closed pieces.
     parts = tm.split(only_watertight=False)
-    if len(parts) > 1:
-        tm = max(parts, key=lambda p: abs(p.volume) if p.is_watertight else 0)
+    n_pieces = len(parts)
+    if n_pieces > 1:
+        closed = [p for p in parts if p.is_watertight]
+        tm = max(closed or parts, key=lambda p: p.area)
     if not tm.is_watertight:
         trimesh.repair.fill_holes(tm)
     trimesh.repair.fix_normals(tm)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vol = abs(tm.volume)
+    if not np.isfinite(vol) or vol <= 0:
+        raise ValueError("reconstructed mesh has no volume (scan may be a single open surface)")
 
     hull_vol = trimesh.Trimesh(np.asarray(pcd.points)).convex_hull.volume
 
@@ -88,7 +106,6 @@ def process(path: Path, res: float, scale: float, save_dir: Path | None) -> dict
         save_dir.mkdir(parents=True, exist_ok=True)
         tm.export(save_dir / f"{path.stem}_mesh.ply")
 
-    vol = abs(tm.volume)
     return {
         "file": path.name,
         "volume_mm3": round(vol, 3),
@@ -96,7 +113,9 @@ def process(path: Path, res: float, scale: float, save_dir: Path | None) -> dict
         "watertight": tm.is_watertight,
         "mesh_to_hull_ratio": round(vol / hull_vol, 4) if hull_vol > 0 else "",
         "points": n_raw,
+        "points_dropped": n_raw - n_kept,
         "triangles": len(tm.faces),
+        "pieces": n_pieces,
         "poisson_depth": depth,
         "cell_size_mm": round(cell, 4),
         "error": "",
@@ -129,7 +148,7 @@ def main() -> None:
         rows.append(row)
 
     fields = ["file", "volume_mm3", "volume_cm3", "watertight", "mesh_to_hull_ratio",
-              "points", "triangles", "poisson_depth", "cell_size_mm", "error"]
+              "points", "points_dropped", "triangles", "pieces", "poisson_depth", "cell_size_mm", "error"]
     with open(args.out, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
